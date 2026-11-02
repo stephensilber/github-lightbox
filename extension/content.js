@@ -3,12 +3,15 @@
   globalThis.__githubImageLightbox = true;
 
   const IMAGE_PATH = /\.(jpe?g|jfif|pjpe?g|pjp|png|apng|gif|webp|avif|bmp|svg|ico)$/i;
+  const VIDEO_PATH = /\.(mp4|m4v|mov|webm|ogv)$/i;
+  const UUID_FILE = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(\.[a-z0-9]+)?$/i;
   const MARKDOWN = '.markdown-body, .comment-body, [data-testid="markdown-body"]';
   const INLINE_HOSTS = new Set([
     'camo.githubusercontent.com',
     'private-user-images.githubusercontent.com',
     'user-images.githubusercontent.com',
   ]);
+  const PLAYER_URL = chrome.runtime.getURL('player.html');
   const GAP = 48;
   const OMEGA = { open: 19, close: 24, zoom: 24, fine: 42, nav: 17, snap: 22, glide: 6 };
   const SVG = 'http://www.w3.org/2000/svg';
@@ -18,6 +21,7 @@
     next: ['M9 6l6 6-6 6'],
     external: ['M14 4h6v6', 'M20 4l-8 8', 'M19 13v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h5'],
     download: ['M12 4v11', 'M7 10.5l5 5 5-5', 'M5 20h14'],
+    expand: ['M15 3h6v6', 'M9 21H3v-6', 'M21 3l-7 7', 'M3 21l7-7'],
   };
 
   const CSS = `
@@ -34,11 +38,12 @@
 .stage.grabbing { cursor: grabbing; }
 .track { position: absolute; inset: 0; transform: translate3d(0, 0, 0); }
 .slide { position: absolute; inset: 0; overflow: hidden; }
-.img {
+.media {
   position: absolute; display: block; max-width: none; max-height: none; margin: 0;
   transform-origin: 50% 50%; opacity: 0; -webkit-user-drag: none; user-select: none;
 }
-.img.pixelated { image-rendering: pixelated; }
+.media.pixelated { image-rendering: pixelated; }
+iframe.media { border: 0; padding: 0; background: transparent; color-scheme: normal; }
 .spinner {
   position: absolute; left: 50%; top: 50%; width: 30px; height: 30px; margin: -15px 0 0 -15px;
   border-radius: 50%; border: 2.5px solid rgb(255 255 255 / 0.18); border-top-color: rgb(255 255 255 / 0.9);
@@ -108,17 +113,34 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .thumb[aria-current="true"] { opacity: 1; }
 .thumb::after { content: ""; position: absolute; inset: 0; border-radius: inherit; box-shadow: inset 0 0 0 2px transparent; transition: box-shadow 0.15s; }
 .thumb[aria-current="true"]::after { box-shadow: inset 0 0 0 2px #fff; }
-.thumb img { display: block; width: 100%; height: 100%; object-fit: cover; opacity: 0; transition: opacity 0.2s; }
-.thumb img.loaded { opacity: 1; }
+.thumb img, .thumb video { display: block; width: 100%; height: 100%; object-fit: cover; opacity: 0; transition: opacity 0.2s; }
+.thumb img.loaded, .thumb video.loaded { opacity: 1; }
+.badge { position: absolute; inset: 0; display: grid; place-items: center; background: rgb(0 0 0 / 0.15); }
+.badge svg { width: 16px; height: 16px; fill: #fff; stroke: none; filter: drop-shadow(0 1px 2px rgb(0 0 0 / 0.6)); }
 @media (max-width: 639px) {
   .nav { display: none; }
   .bar { padding-left: 14px; }
 }
 `;
 
+  const EXPAND_CSS = `
+:host { all: initial; }
+button {
+  width: 34px; height: 34px; margin: 0; padding: 0; border: 0; border-radius: 8px;
+  display: grid; place-items: center; color: #fff; cursor: pointer;
+  background: rgb(0 0 0 / 0.55); box-shadow: 0 1px 4px rgb(0 0 0 / 0.3);
+  -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+  animation: appear 0.15s ease both; transition: background 0.15s, transform 0.15s;
+}
+button:hover { background: rgb(0 0 0 / 0.75); transform: scale(1.06); }
+button:focus-visible { outline: 2px solid #4493f8; outline-offset: 2px; }
+svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+@keyframes appear { from { opacity: 0; transform: scale(0.9); } }
+`;
+
   const srcCache = new Map();
   const pending = new Map();
-  let sheet = null;
+  const sheets = new Map();
   let active = null;
 
   const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
@@ -143,6 +165,15 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
     return url.href;
   }
 
+  // Inline uploads use signed URLs that expire a few minutes after the page renders. The stable
+  // github.com/user-attachments/assets/<uuid> URL redirects to a freshly signed one.
+  function freshAssetUrl(src) {
+    const url = parseUrl(src);
+    if (url?.hostname !== 'private-user-images.githubusercontent.com') return null;
+    const m = UUID_FILE.exec(url.pathname);
+    return m ? `https://github.com/user-attachments/assets/${m[1]}` : null;
+  }
+
   function fileName(url) {
     let name = url.pathname.split('/').pop() || '';
     try {
@@ -159,47 +190,69 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
     return fileName(url);
   }
 
-  function describe(a) {
+  function makeItem(kind, src, href, source, thumb, title) {
+    return { kind, src, href, source, thumb, title, trusted: isGitHubHost(parseUrl(src)?.hostname || '') };
+  }
+
+  function describeLink(a) {
     if (!a.closest(MARKDOWN)) return null;
     const url = parseUrl(a.href);
     if (!url || (url.protocol !== 'https:' && url.protocol !== 'http:')) return null;
     const img = a.querySelector('img');
     const imgSrc = img ? img.currentSrc || img.src : '';
     const raw = rawUrl(url);
-    const isImageFile =
-      IMAGE_PATH.test(url.pathname) || (url.hostname === 'github.com' && url.pathname.startsWith('/user-attachments/assets/'));
-    const wrapsItself = Boolean(imgSrc) && (imgSrc === url.href || imgSrc === raw || INLINE_HOSTS.has(url.hostname));
-    if (!isImageFile && !wrapsItself) return null;
-    const src = wrapsItself ? imgSrc : raw;
-    return {
-      src,
-      href: url.href,
-      thumb: imgSrc || null,
-      source: imgSrc ? img : null,
-      title: titleFor(a, img, url),
-      trusted: isGitHubHost(parseUrl(src)?.hostname || ''),
-    };
+    const title = titleFor(a, img, url);
+    const source = imgSrc ? img : null;
+    if (VIDEO_PATH.test(url.pathname)) return makeItem('video', raw, url.href, source, imgSrc || null, title);
+    if (imgSrc && (imgSrc === url.href || imgSrc === raw || INLINE_HOSTS.has(url.hostname))) {
+      return makeItem('image', imgSrc, url.href, source, imgSrc, title);
+    }
+    if (IMAGE_PATH.test(url.pathname)) return makeItem('image', raw, url.href, source, imgSrc || null, title);
+    if (url.hostname === 'github.com' && url.pathname.startsWith('/user-attachments/assets/')) {
+      return makeItem('unknown', raw, url.href, source, imgSrc || null, title);
+    }
+    return null;
+  }
+
+  function describeVideo(video) {
+    if (!video.closest(MARKDOWN)) return null;
+    const url = parseUrl(video.currentSrc || video.src || video.querySelector('source[src]')?.src || '');
+    if (!url || (url.protocol !== 'https:' && url.protocol !== 'http:')) return null;
+    const summary = video.closest('details')?.querySelector('summary')?.textContent.trim();
+    return makeItem('video', url.href, url.href, video, url.href, summary || fileName(url));
+  }
+
+  function describe(el) {
+    return el instanceof HTMLVideoElement ? describeVideo(el) : describeLink(el);
   }
 
   function collect(clicked) {
     const items = [];
     const seen = new Map();
     let index = 0;
-    for (const a of document.querySelectorAll('a[href]')) {
-      if (!a.closest(MARKDOWN)) continue;
-      if (a !== clicked && !a.getClientRects().length) continue;
-      const item = describe(a);
+    for (const el of document.querySelectorAll('a[href], video')) {
+      if (!el.closest(MARKDOWN)) continue;
+      if (el !== clicked && !el.getClientRects().length) continue;
+      const item = describe(el);
       if (!item) continue;
       let i = seen.get(item.src);
       if (i === undefined) {
         i = items.push(item) - 1;
         seen.set(item.src, i);
-      } else if (a === clicked) {
+      } else if (el === clicked) {
         items[i] = item;
       }
-      if (a === clicked) index = i;
+      if (el === clicked) index = i;
     }
     return { items, index };
+  }
+
+  function openFor(el) {
+    const { items, index } = collect(el);
+    if (!items.length) return;
+    expander.hide();
+    active?.destroy();
+    active = new Lightbox(items, index, el);
   }
 
   function fromBase64(data) {
@@ -210,23 +263,40 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
     return bytes;
   }
 
-  // GitHub's CSP blocks most third-party image hosts, so a failed direct load is retried through the
-  // service worker and shown from a blob: URL, which the CSP allows.
+  function ask(message) {
+    return Promise.resolve()
+      .then(() => chrome.runtime.sendMessage(message))
+      .then(res => {
+        if (!res?.ok) throw new Error(res?.error || 'Request failed');
+        return res;
+      });
+  }
+
+  // GitHub's CSP blocks some image hosts, so a failed direct load is retried through the service
+  // worker and shown from a blob: URL, which the CSP allows for images.
   function viaBackground(url) {
     let request = pending.get(url);
     if (!request) {
-      request = Promise.resolve()
-        .then(() => chrome.runtime.sendMessage({ type: 'fetch-image', url }))
-        .then(res => {
-          if (!res?.ok) throw new Error(res?.error || 'Image request failed');
-          const src = URL.createObjectURL(new Blob([fromBase64(res.data)], { type: res.type }));
-          srcCache.set(url, src);
-          return src;
-        });
+      request = ask({ type: 'fetch-image', url }).then(res => {
+        const src = URL.createObjectURL(new Blob([fromBase64(res.data)], { type: res.type }));
+        srcCache.set(url, src);
+        return src;
+      });
       request.catch(() => pending.delete(url));
       pending.set(url, request);
     }
     return request;
+  }
+
+  // github.com media URLs need your cookies and then redirect to a signed URL. The service worker
+  // follows the redirect so the player frame can load the signed URL without cookies.
+  function playableUrl(src) {
+    const url = parseUrl(src);
+    if (url?.hostname !== 'github.com' && url?.hostname !== 'gist.github.com') return Promise.resolve(src);
+    return ask({ type: 'resolve-media', url: src }).then(
+      res => res.url,
+      () => src,
+    );
   }
 
   function loadInto(img, src) {
@@ -256,6 +326,16 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
     return svg;
   }
 
+  function playIcon() {
+    const svg = document.createElementNS(SVG, 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('aria-hidden', 'true');
+    const path = document.createElementNS(SVG, 'path');
+    path.setAttribute('d', 'M8 5.5v13a1 1 0 0 0 1.5.86l10.5-6.5a1 1 0 0 0 0-1.72L9.5 4.64A1 1 0 0 0 8 5.5z');
+    svg.append(path);
+    return svg;
+  }
+
   function button(cls, label, iconName, onClick) {
     const b = h('button', { type: 'button', class: cls, 'aria-label': label, title: label });
     if (iconName) b.append(icon(iconName));
@@ -263,15 +343,17 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
     return b;
   }
 
-  function adoptStyles(root) {
+  function adoptStyles(root, css) {
     try {
+      let sheet = sheets.get(css);
       if (!sheet) {
         sheet = new CSSStyleSheet();
-        sheet.replaceSync(CSS);
+        sheet.replaceSync(css);
+        sheets.set(css, sheet);
       }
       root.adoptedStyleSheets = [sheet];
     } catch {
-      root.append(h('style', {}, CSS));
+      root.append(h('style', {}, css));
     }
   }
 
@@ -344,46 +426,74 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
       this.box = box;
       this.item = item;
       this.index = index;
+      this.kind = item.kind === 'video' ? 'video' : 'image';
       this.s = new Spring(1, 0.0005);
       this.x = new Spring(0, 0.1);
       this.y = new Spring(0, 0.1);
       this.a = new Spring(0, 0.003);
       this.nw = this.nh = this.fw = this.fh = 0;
       this.maxS = 4;
-      this.started = this.ready = this.failed = this.dead = false;
-      this.img = h('img', { class: 'img', alt: item.title, draggable: 'false', decoding: 'async' });
-      this.img.addEventListener('load', () => this.loaded());
-      this.img.addEventListener('error', () => this.errored());
+      this.time = 0;
+      this.started = this.ready = this.failed = this.dead = this.retried = false;
+      this.media = this.kind === 'video' ? this.makeFrame() : this.makeImage();
       this.spinner = h('div', { class: 'spinner' });
-      this.el = h('div', { class: 'slide' }, this.img, this.spinner);
+      this.el = h('div', { class: 'slide' }, this.media, this.spinner);
+    }
+
+    makeImage() {
+      const img = h('img', { class: 'media', alt: this.item.title, draggable: 'false', decoding: 'async' });
+      img.addEventListener('load', () => this.imageLoaded());
+      img.addEventListener('error', () => this.imageFailed());
+      return img;
+    }
+
+    // Videos play inside an extension page. GitHub's media-src CSP blocks most video hosts for
+    // anything the content script creates, but extension frames are exempt from the page's CSP.
+    makeFrame() {
+      return h('iframe', {
+        class: 'media',
+        title: this.item.title || 'Video',
+        // With use_dynamic_url the frame's origin differs from its src, so the default 'src'
+        // allowlist would not match. The frame only ever loads our own player page.
+        allow: 'autoplay *; fullscreen *; picture-in-picture *',
+        allowfullscreen: '',
+      });
     }
 
     start(priority) {
       if (this.started) return;
       this.started = true;
+      if (this.kind === 'video') {
+        this.loadVideo(this.item.src);
+        return;
+      }
       const cached = srcCache.get(this.item.src);
-      this.direct = !cached;
-      this.img.fetchPriority = priority;
-      this.img.src = cached || this.item.src;
+      this.attempt = cached ? 'background' : 'direct';
+      this.media.fetchPriority = priority;
+      this.media.src = cached || this.item.src;
     }
 
-    async loaded() {
-      await this.img.decode().catch(() => {});
-      if (this.dead || this.ready) return;
-      this.nw = this.img.naturalWidth || 1200;
-      this.nh = this.img.naturalHeight || 900;
-      this.ready = true;
-      this.spinner.remove();
-      this.box.slideReady(this);
+    async imageLoaded() {
+      await this.media.decode().catch(() => {});
+      if (this.dead || this.ready || this.kind !== 'image') return;
+      this.nw = this.media.naturalWidth || 1200;
+      this.nh = this.media.naturalHeight || 900;
+      this.becomeReady();
     }
 
-    errored() {
-      if (this.dead || this.ready) return;
-      if (this.direct) {
-        this.direct = false;
+    imageFailed() {
+      if (this.dead || this.ready || this.kind !== 'image') return;
+      const fresh = freshAssetUrl(this.item.src);
+      if (this.attempt === 'direct' && fresh) {
+        this.attempt = 'fresh';
+        this.media.src = fresh;
+      } else if (this.item.kind === 'unknown') {
+        this.becomeVideo();
+      } else if (this.attempt !== 'background') {
+        this.attempt = 'background';
         viaBackground(this.item.src).then(
           src => {
-            if (!this.dead) this.img.src = src;
+            if (!this.dead) this.media.src = src;
           },
           () => this.fail(),
         );
@@ -392,15 +502,67 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
       }
     }
 
+    becomeVideo() {
+      this.kind = 'video';
+      const frame = this.makeFrame();
+      this.media.replaceWith(frame);
+      this.media = frame;
+      this.loadVideo(this.item.src);
+    }
+
+    async loadVideo(src) {
+      const url = await playableUrl(src);
+      if (this.dead) return;
+      const source = this.item.source;
+      const state = {
+        src: url,
+        autoplay: this.index === this.box.index && !this.box.closing,
+        muted: this.box.muted,
+        time: source instanceof HTMLVideoElement && !source.ended ? source.currentTime : 0,
+      };
+      this.media.src = `${PLAYER_URL}#${encodeURIComponent(JSON.stringify(state))}`;
+    }
+
+    onPlayer(data) {
+      if (this.dead) return;
+      if (data.type === 'ready' && !this.ready) {
+        this.nw = data.width || 1280;
+        this.nh = data.height || 720;
+        this.becomeReady();
+      } else if (data.type === 'error' && !this.ready) {
+        const fresh = freshAssetUrl(this.item.src);
+        if (fresh && !this.retried) {
+          this.retried = true;
+          this.loadVideo(fresh);
+        } else {
+          this.fail();
+        }
+      } else if (data.type === 'state') {
+        this.time = data.time;
+        this.box.videoState(this, data);
+      }
+    }
+
+    send(type, extra) {
+      if (this.kind === 'video') this.media.contentWindow?.postMessage({ ghLightbox: true, type, ...extra }, '*');
+    }
+
+    becomeReady() {
+      this.ready = true;
+      this.spinner.remove();
+      this.box.slideReady(this);
+    }
+
     fail() {
       if (this.dead || this.failed) return;
       this.failed = true;
       this.spinner.remove();
+      this.media.style.display = 'none';
       this.el.append(
         h(
           'div',
           { class: 'error' },
-          h('div', {}, 'Couldn’t preview this image'),
+          h('div', {}, this.kind === 'video' ? 'Couldn’t play this video' : 'Couldn’t preview this image'),
           h('a', { href: this.item.href, target: '_blank', rel: 'noopener noreferrer' }, 'Open link'),
         ),
       );
@@ -432,6 +594,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
       this.thumbsOn = false;
       this.wheelAcc = 0;
       this.lastWheel = 0;
+      this.muted = false;
       this.tick = this.tick.bind(this);
       this.build();
       this.measure();
@@ -452,7 +615,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
       this.host.setAttribute('data-github-image-lightbox', '');
       this.host.style.cssText = 'position:fixed;inset:0;z-index:2147483646;display:block;margin:0;padding:0;border:0;';
       this.shadow = this.host.attachShadow({ mode: 'open' });
-      adoptStyles(this.shadow);
+      adoptStyles(this.shadow, CSS);
 
       this.backdrop = h('div', { class: 'backdrop' });
       this.trackEl = h('div', { class: 'track' });
@@ -476,7 +639,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
       if (this.items.length > 1) this.ui.append(this.prevBtn, this.nextBtn, this.buildStrip());
       this.root = h(
         'div',
-        { class: 'root', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Image viewer', tabindex: '-1' },
+        { class: 'root', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Media viewer', tabindex: '-1' },
         this.backdrop,
         this.stage,
         this.ui,
@@ -494,9 +657,11 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
       this.onKey = e => this.key(e);
       this.onResize = () => this.resize();
       this.onLeave = () => this.destroy();
+      this.onMessage = e => this.message(e);
       addEventListener('keydown', this.onKey, true);
       addEventListener('resize', this.onResize);
       addEventListener('popstate', this.onLeave);
+      addEventListener('message', this.onMessage);
       document.addEventListener('turbo:before-visit', this.onLeave);
     }
 
@@ -514,17 +679,30 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
         { root: this.strip, rootMargin: '0px 240px' },
       );
       this.thumbs = this.items.map((item, i) => {
-        const img = h('img', { alt: '', draggable: 'false', decoding: 'async' });
-        img.addEventListener('load', () => img.classList.add('loaded'));
-        const b = button('thumb', item.title ? `Image ${i + 1}: ${item.title}` : `Image ${i + 1}`, null, () => this.goTo(i));
+        const b = button('thumb', item.title ? `Item ${i + 1}: ${item.title}` : `Item ${i + 1}`, null, () => this.goTo(i));
         b.dataset.i = String(i);
-        b.append(img);
         this.strip.append(b);
-        const thumb = { b, img, item, done: false };
+        const thumb = { b, img: null, item, done: true };
+        if (item.kind === 'video' && !item.thumb) {
+          b.append(h('span', { class: 'badge' }, playIcon()));
+          return thumb;
+        }
+        if (item.kind === 'video' && item.source instanceof HTMLVideoElement) {
+          const video = h('video', { muted: '', playsinline: '', preload: 'metadata', tabindex: '-1' });
+          video.muted = true;
+          video.addEventListener('loadeddata', () => video.classList.add('loaded'));
+          video.src = `${item.thumb}#t=0.5`;
+          b.append(video, h('span', { class: 'badge' }, playIcon()));
+          return thumb;
+        }
+        thumb.img = h('img', { alt: '', draggable: 'false', decoding: 'async' });
+        thumb.img.addEventListener('load', () => thumb.img.classList.add('loaded'));
+        b.append(thumb.img);
+        if (item.kind === 'video') b.append(h('span', { class: 'badge' }, playIcon()));
         if (item.thumb) {
-          img.src = item.thumb;
-          thumb.done = true;
+          thumb.img.src = item.thumb;
         } else {
+          thumb.done = false;
           this.io.observe(b);
         }
         return thumb;
@@ -560,7 +738,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
       try {
         await loadInto(thumb.img, cached || thumb.item.src);
       } catch {
-        if (cached || this.dead) return;
+        if (cached || this.dead || thumb.item.kind === 'unknown') return;
         try {
           await loadInto(thumb.img, await viaBackground(thumb.item.src));
         } catch {}
@@ -569,9 +747,9 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 
     fillThumb(slide) {
       const thumb = this.thumbs?.[slide.index];
-      if (!thumb || thumb.done) return;
+      if (!thumb || thumb.done || slide.kind !== 'image') return;
       thumb.done = true;
-      thumb.img.src = slide.img.currentSrc || slide.img.src;
+      thumb.img.src = slide.media.currentSrc || slide.media.src;
     }
 
     measure() {
@@ -591,11 +769,11 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
       if (!slide.ready) return;
       const aw = Math.max(80, this.vw - this.padX * 2);
       const ah = Math.max(80, this.vh - this.padTop - this.padBottom);
-      const r = Math.min(1, aw / slide.nw, ah / slide.nh);
+      const r = Math.min(slide.kind === 'video' ? 2 : 1, aw / slide.nw, ah / slide.nh);
       slide.fw = slide.nw * r;
       slide.fh = slide.nh * r;
       slide.maxS = Math.max(4, (slide.nw / slide.fw) * 4);
-      const style = slide.img.style;
+      const style = slide.media.style;
       style.width = `${slide.fw}px`;
       style.height = `${slide.fh}px`;
       style.left = `${this.cx - slide.fw / 2}px`;
@@ -632,6 +810,35 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
       }
     }
 
+    syncPlayback() {
+      for (const slide of this.slides.values()) {
+        if (slide.kind !== 'video' || !slide.ready) continue;
+        const playing = slide.index === this.index && !this.closing;
+        slide.send(playing ? 'play' : 'pause', { muted: this.muted });
+        const source = slide.item.source;
+        if (playing && source instanceof HTMLVideoElement && !source.paused) source.pause();
+      }
+    }
+
+    videoState(slide, data) {
+      if (slide.index === this.index) this.muted = data.muted;
+    }
+
+    message(e) {
+      if (!e.data?.ghLightbox || !String(e.origin).startsWith('chrome-extension://')) return;
+      for (const slide of this.slides.values()) {
+        if (slide.kind !== 'video' || slide.media.contentWindow !== e.source) continue;
+        if (e.data.type === 'key') {
+          if (this.handleKey(e.data.key, e.data.shiftKey) && !this.dead) this.root.focus({ preventScroll: true });
+        } else if (e.data.type === 'wheel') {
+          this.wheelInput(e.data.dx, e.data.dy, e.data.ctrlKey, 0, 0, 0);
+        } else {
+          slide.onPlayer(e.data);
+        }
+        return;
+      }
+    }
+
     slideReady(slide) {
       if (this.closing) return;
       this.fit(slide);
@@ -639,6 +846,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
       if (slide.index !== this.index) {
         slide.a.set(1);
         this.render();
+        this.syncPlayback();
         return;
       }
       if (!this.revealed) {
@@ -649,6 +857,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
         slide.a.to(1, OMEGA.snap);
         slide.s.to(1, OMEGA.snap);
       }
+      this.syncPlayback();
       this.unlockThumbs();
       this.updateUi();
       this.kick();
@@ -739,16 +948,16 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
       for (const slide of this.slides.values()) {
         if (!slide.ready) continue;
         const s = slide.s.p * (slide === cur ? 1 - dismiss * 0.12 : 1);
-        slide.img.style.transform = `translate3d(${slide.x.p}px,${slide.y.p}px,0) scale(${s})`;
-        slide.img.style.opacity = String(clamp(slide.a.p, 0, 1));
+        slide.media.style.transform = `translate3d(${slide.x.p}px,${slide.y.p}px,0) scale(${s})`;
+        slide.media.style.opacity = String(clamp(slide.a.p, 0, 1));
       }
       if (!cur?.ready) return;
       const pct = Math.round(((cur.s.p * cur.fw) / cur.nw) * 100);
-      const text = `${pct}%`;
+      const text = cur.kind === 'video' ? '' : `${pct}%`;
       if (text !== this.zoomText) {
         this.zoomText = text;
         this.zoomBtn.textContent = text;
-        cur.img.classList.toggle('pixelated', pct >= 400);
+        if (cur.kind === 'image') cur.media.classList.toggle('pixelated', pct >= 400);
       }
       this.stage.classList.toggle('zoomed', cur.s.t > 1.001);
     }
@@ -796,6 +1005,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
       this.track.p = clamp(this.track.p + Math.sign(delta) * this.pitch, -2 * this.pitch, 2 * this.pitch);
       this.track.to(0, OMEGA.nav, velocity ?? this.track.v);
       this.sync();
+      this.syncPlayback();
       this.updateUi();
       this.poke();
       this.kick();
@@ -806,7 +1016,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
     }
 
     zoomTo(slide, scale, px, py, w = OMEGA.zoom) {
-      if (!slide?.ready || this.closing) return;
+      if (!slide?.ready || slide.kind !== 'image' || this.closing) return;
       const ns = clamp(scale, 1, slide.maxS);
       const k = ns / slide.s.t;
       const b = this.bounds(slide, ns);
@@ -827,10 +1037,10 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
       else this.zoomTo(cur, Math.max(2.5, cur.nw / cur.fw), px, py);
     }
 
-    hitImage(x, y) {
+    hitMedia(x, y) {
       const cur = this.cur;
       if (!cur?.ready) return false;
-      const r = cur.img.getBoundingClientRect();
+      const r = cur.media.getBoundingClientRect();
       return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
     }
 
@@ -842,7 +1052,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
         sx: e.clientX,
         sy: e.clientY,
         mode: null,
-        onImage: this.hitImage(e.clientX, e.clientY),
+        onMedia: this.hitMedia(e.clientX, e.clientY),
         samples: [[e.clientX, e.clientY, e.timeStamp]],
       };
     }
@@ -896,7 +1106,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
       this.drag = null;
       this.stage.classList.remove('grabbing');
       if (!d.mode) {
-        if (released && !d.onImage) this.close();
+        if (released && !d.onMedia) this.close();
         return;
       }
       const [vx, vy] = velocity(d.samples, e.timeStamp);
@@ -932,24 +1142,27 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
     doubleClick(e) {
       const cur = this.cur;
       if (!cur?.ready || this.closing) return;
-      if (cur.s.t > 1.001 || this.hitImage(e.clientX, e.clientY)) this.toggleZoom(e.clientX, e.clientY);
+      if (cur.s.t > 1.001 || this.hitMedia(e.clientX, e.clientY)) this.toggleZoom(e.clientX, e.clientY);
     }
 
     wheel(e) {
       e.preventDefault();
-      if (this.closing) return;
       if (this.strip && e.composedPath().includes(this.strip)) {
         this.strip.scrollLeft += Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
         return;
       }
-      const cur = this.cur;
-      if (!cur?.ready || this.drag) return;
       const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? this.vh : 1;
-      const dx = e.deltaX * unit;
-      const dy = e.deltaY * unit;
-      const gap = e.timeStamp - this.lastWheel;
-      this.lastWheel = e.timeStamp;
-      if (!e.ctrlKey && Math.abs(dx) > Math.abs(dy)) {
+      // Notched mouse wheels report wheelDeltaY in steps of 120; trackpads and pinches stream small deltas.
+      const notches = !e.ctrlKey && e.wheelDeltaY && e.wheelDeltaY % 120 === 0 ? -e.wheelDeltaY / 120 : 0;
+      this.wheelInput(e.deltaX * unit, e.deltaY * unit, e.ctrlKey, e.clientX, e.clientY, notches, e.timeStamp);
+    }
+
+    wheelInput(dx, dy, ctrlKey, px, py, notches, time = performance.now()) {
+      const cur = this.cur;
+      if (this.closing || !cur?.ready || this.drag) return;
+      const gap = time - this.lastWheel;
+      this.lastWheel = time;
+      if (!ctrlKey && Math.abs(dx) > Math.abs(dy)) {
         if (cur.s.t > 1.001) {
           const b = this.bounds(cur, cur.s.t);
           cur.x.to(clamp(cur.x.t - dx, b.minX, b.maxX), OMEGA.fine);
@@ -960,10 +1173,8 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
         return;
       }
       if (!dy) return;
-      // Notched mouse wheels report wheelDeltaY in steps of 120; trackpads and pinches stream small deltas.
-      const notches = !e.ctrlKey && e.wheelDeltaY && e.wheelDeltaY % 120 === 0 ? -e.wheelDeltaY / 120 : 0;
-      const amount = e.ctrlKey ? dy * 0.012 : notches ? notches * 0.22 : dy * 0.0035;
-      this.zoomTo(cur, cur.s.t * Math.exp(-amount), e.clientX, e.clientY, notches ? OMEGA.zoom : OMEGA.fine);
+      const amount = ctrlKey ? dy * 0.012 : notches ? notches * 0.22 : dy * 0.0035;
+      this.zoomTo(cur, cur.s.t * Math.exp(-amount), px, py, notches ? OMEGA.zoom : OMEGA.fine);
     }
 
     // Trackpad momentum keeps sending wheel events after a flick, so one gesture is allowed to
@@ -984,66 +1195,82 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
     key(e) {
       if (this.dead || e.metaKey || e.ctrlKey || e.altKey) return;
       e.stopImmediatePropagation();
-      if (this.closing) return;
       const target = e.composedPath()[0];
       if ((e.key === 'Enter' || e.key === ' ') && target instanceof HTMLElement && target.matches('button, a')) return;
+      if (e.key === 'Tab') {
+        this.trapFocus(e);
+        return;
+      }
+      if (this.handleKey(e.key, e.shiftKey)) e.preventDefault();
+    }
+
+    handleKey(key, shiftKey) {
+      if (this.closing) return false;
       const cur = this.cur;
-      const step = 120;
-      switch (e.key) {
+      const video = cur?.kind === 'video';
+      switch (key) {
         case 'Escape':
+          if (document.fullscreenElement) return false;
           this.close();
-          break;
+          return true;
         case 'ArrowLeft':
           this.go(-1);
-          break;
+          return true;
         case 'ArrowRight':
+          this.go(1);
+          return true;
         case ' ':
-          this.go(e.shiftKey ? -1 : 1);
-          break;
+          if (video) cur.send('toggle');
+          else this.go(shiftKey ? -1 : 1);
+          return true;
         case 'Home':
           this.goTo(0);
-          break;
+          return true;
         case 'End':
           this.goTo(this.items.length - 1);
-          break;
+          return true;
         case '+':
         case '=':
           this.zoomTo(cur, (cur?.s.t || 1) * 1.5, this.vw / 2, this.vh / 2);
-          break;
+          return true;
         case '-':
         case '_':
           this.zoomTo(cur, (cur?.s.t || 1) / 1.5, this.vw / 2, this.vh / 2);
-          break;
+          return true;
         case '0':
           this.zoomTo(cur, 1, this.vw / 2, this.vh / 2);
-          break;
+          return true;
         case 'z':
         case 'Z':
           this.toggleZoom();
-          break;
+          return true;
+        case 'm':
+        case 'M':
+          if (video) cur.send('mute');
+          return video;
+        case 'f':
+        case 'F':
+          if (video && cur.ready) cur.media.requestFullscreen?.().catch(() => {});
+          return video;
         case 'o':
         case 'O':
           this.openOriginal();
-          break;
+          return true;
         case 'd':
         case 'D':
           this.download();
-          break;
+          return true;
         case 'ArrowUp':
         case 'ArrowDown':
           if (cur?.ready && cur.s.t > 1.001) {
             const b = this.bounds(cur, cur.s.t);
-            cur.y.to(clamp(cur.y.t + (e.key === 'ArrowUp' ? step : -step), b.minY, b.maxY), OMEGA.zoom);
+            cur.y.to(clamp(cur.y.t + (key === 'ArrowUp' ? 120 : -120), b.minY, b.maxY), OMEGA.zoom);
             this.kick();
           }
-          break;
-        case 'Tab':
-          this.trapFocus(e);
-          return;
+          return true;
         default:
-          return;
+          return false;
       }
-      e.preventDefault();
     }
 
     trapFocus(e) {
@@ -1084,12 +1311,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 
     download() {
       const item = this.items[this.index];
-      Promise.resolve()
-        .then(() => chrome.runtime.sendMessage({ type: 'download', url: item.src }))
-        .then(res => {
-          if (!res?.ok) throw new Error(res?.error);
-        })
-        .catch(() => window.open(item.href, '_blank', 'noopener,noreferrer'));
+      ask({ type: 'download', url: item.src }).catch(() => window.open(item.href, '_blank', 'noopener,noreferrer'));
     }
 
     close(vy) {
@@ -1097,6 +1319,10 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
       const cur = this.cur;
       const dismiss = this.dismissAmount();
       this.closing = true;
+      this.syncPlayback();
+      if (cur?.kind === 'video' && cur.item.source instanceof HTMLVideoElement && Number.isFinite(cur.time) && cur.time > 0) {
+        cur.item.source.currentTime = cur.time;
+      }
       this.open.to(0, OMEGA.close);
       this.track.to(0, OMEGA.close);
       const r = cur?.ready ? this.sourceRect(cur.item) : null;
@@ -1128,6 +1354,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
       removeEventListener('keydown', this.onKey, true);
       removeEventListener('resize', this.onResize);
       removeEventListener('popstate', this.onLeave);
+      removeEventListener('message', this.onMessage);
       document.removeEventListener('turbo:before-visit', this.onLeave);
       this.io?.disconnect();
       for (const slide of this.slides.values()) slide.destroy();
@@ -1138,18 +1365,97 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
     }
   }
 
+  // Clicks on an inline video belong to its native controls, so hovering one shows a small button
+  // that opens it in the viewer instead.
+  const expander = {
+    host: null,
+    video: null,
+    timer: 0,
+
+    ensure() {
+      if (this.host) return;
+      this.host = h('div', { 'data-github-image-lightbox-expand': '' });
+      this.host.style.cssText = 'position:fixed;top:0;left:0;z-index:2147483645;display:none;margin:0;padding:0;';
+      const shadow = this.host.attachShadow({ mode: 'open' });
+      adoptStyles(shadow, EXPAND_CSS);
+      shadow.append(
+        button('', 'Open in viewer', 'expand', e => {
+          e.preventDefault();
+          e.stopPropagation();
+          const video = this.video;
+          if (video?.isConnected) openFor(video);
+        }),
+      );
+      this.host.addEventListener('pointerenter', () => clearTimeout(this.timer));
+      this.host.addEventListener('pointerleave', e => {
+        if (e.relatedTarget !== this.video) this.scheduleHide();
+      });
+      document.documentElement.append(this.host);
+    },
+
+    show(video) {
+      this.ensure();
+      clearTimeout(this.timer);
+      if (this.video === video && this.host.style.display === 'block') return;
+      this.video = video;
+      this.host.style.display = 'block';
+      this.place();
+    },
+
+    place() {
+      const r = this.video?.getBoundingClientRect();
+      if (!r?.width || document.fullscreenElement) return this.hide();
+      const top = clamp(r.top + 10, 10, r.bottom - 44);
+      this.host.style.transform = `translate(${r.right - 44}px, ${top}px)`;
+    },
+
+    scheduleHide() {
+      clearTimeout(this.timer);
+      this.timer = setTimeout(() => this.hide(), 300);
+    },
+
+    hide() {
+      clearTimeout(this.timer);
+      if (this.host) this.host.style.display = 'none';
+      this.video = null;
+    },
+  };
+
+  document.addEventListener(
+    'pointerover',
+    e => {
+      if (active || e.pointerType === 'touch') return;
+      const video = e.target instanceof Element ? e.target.closest('video') : null;
+      if (video && describeVideo(video)) expander.show(video);
+    },
+    true,
+  );
+
+  document.addEventListener(
+    'pointerout',
+    e => {
+      if (expander.video && e.target === expander.video && e.relatedTarget !== expander.host) expander.scheduleHide();
+    },
+    true,
+  );
+
+  addEventListener(
+    'scroll',
+    () => {
+      if (expander.video) expander.place();
+    },
+    { capture: true, passive: true },
+  );
+
   addEventListener(
     'click',
     e => {
       if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
       const a = e.target instanceof Element ? e.target.closest('a[href]') : null;
-      if (!a || !describe(a)) return;
+      if (!a || !describeLink(a)) return;
       e.preventDefault();
       e.stopImmediatePropagation();
-      const { items, index } = collect(a);
-      if (!items.length) return;
-      active?.destroy();
-      active = new Lightbox(items, index, a);
+      openFor(a);
     },
     true,
   );

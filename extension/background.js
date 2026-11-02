@@ -6,6 +6,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     fetchImage(message.url).then(sendResponse);
     return true;
   }
+  if (message?.type === 'resolve-media') {
+    resolveMedia(message.url).then(sendResponse);
+    return true;
+  }
   if (message?.type === 'download') {
     chrome.downloads.download({ url: message.url }).then(
       () => sendResponse({ ok: true }),
@@ -34,6 +38,21 @@ async function fetchImage(url) {
     if (!type) return { ok: false, error: 'Not an image' };
     return { ok: true, type, data: toBase64(bytes) };
   } catch (error) {
+    return { ok: false, error: String(error?.message || error) };
+  }
+}
+
+async function resolveMedia(url) {
+  const controller = new AbortController();
+  try {
+    const parsed = new URL(url);
+    if (!isGitHub(parsed.hostname)) return { ok: true, url: parsed.href };
+    const res = await fetch(parsed, { credentials: 'include', signal: controller.signal });
+    controller.abort();
+    if (!res.redirected && !res.ok) return { ok: false, error: `HTTP ${res.status}` };
+    return { ok: true, url: res.url };
+  } catch (error) {
+    controller.abort();
     return { ok: false, error: String(error?.message || error) };
   }
 }

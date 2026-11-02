@@ -75,7 +75,7 @@ export async function viewerState(page) {
     const root = document.querySelector('[data-github-image-lightbox]')?.shadowRoot;
     if (!root) return null;
     const slide = [...root.querySelectorAll('.slide')].find(s => /translate3d\(0px/.test(s.style.transform));
-    const img = slide?.querySelector('img');
+    const img = slide?.querySelector('.media');
     const scale = Number(/scale\(([\d.e-]+)\)/.exec(img?.style.transform || '')?.[1] || 0);
     const translate = /translate3d\((-?[\d.e-]+)px, (-?[\d.e-]+)px/.exec(img?.style.transform || '');
     return {
@@ -89,6 +89,7 @@ export async function viewerState(page) {
       scale,
       x: translate ? Number(translate[1]) : 0,
       y: translate ? Number(translate[2]) : 0,
+      tag: img?.tagName.toLowerCase() ?? '',
       error: Boolean(slide?.querySelector('.error')),
       styled: getComputedStyle(root.querySelector('.root')).position === 'absolute',
       thumbsLoaded: [...root.querySelectorAll('.thumb img.loaded')].length,

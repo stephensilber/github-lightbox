@@ -57,3 +57,27 @@ test('works on a real github.com issue under GitHub’s CSP', async () => {
     await app.dispose();
   }
 });
+
+test('plays an inline video from a real github.com issue', async () => {
+  const app = await launchWithExtension();
+  try {
+    const page = await app.context.newPage();
+    await page.goto(process.env.LIVE_VIDEO_ISSUE || 'https://github.com/signalapp/Signal-Android/issues/15085', { waitUntil: 'domcontentloaded' });
+    const video = page.locator('.markdown-body video').first();
+    await video.scrollIntoViewIfNeeded();
+    await video.hover();
+    await page.locator('[data-github-image-lightbox-expand]').getByRole('button', { name: 'Open in viewer' }).click();
+    const frame = await expect
+      .poll(() => page.frames().find(f => f.url().includes('player.html')), { timeout: 10_000 })
+      .toBeTruthy()
+      .then(() => page.frames().find(f => f.url().includes('player.html')));
+    await expect
+      .poll(() => frame.evaluate(() => { const v = document.querySelector('video'); return !v.paused && v.currentTime > 0.3; }), { timeout: 15_000 })
+      .toBe(true);
+    const info = await frame.evaluate(() => { const v = document.querySelector('video'); return `${v.videoWidth}×${v.videoHeight} ${new URL(v.currentSrc).host}`; });
+    console.log('inline video playing', info);
+    await page.screenshot({ path: join(SHOTS, 'live-03-video.png') });
+  } finally {
+    await app.dispose();
+  }
+});
